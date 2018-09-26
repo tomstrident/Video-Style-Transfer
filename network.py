@@ -1,14 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Aug  8 12:45:24 2018
 
-@author: tom
-"""
 
 from threading import Thread
 import socket
-import struct # to send `int` as  `4 bytes`
+import struct
 import time
 
 import numpy as np
@@ -31,7 +25,7 @@ class network(Thread):
   def host_connect(self):
     print("Wait for connection")
     self.sc, self.info = self.s.accept()
-    print("Video client connected:", self.info)
+    print("VST client connected:", self.info)
     
     self.net = self.sc
   

@@ -1,10 +1,12 @@
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
 import cv2
 import time
 import imageio
 
+import network
 import numpy as np
 import tensorflow as tf
 import opticalflow as of
@@ -13,34 +15,24 @@ from scipy.io import loadmat
 #from diffusion_inpainting import image_diffusion
 from scipy.ndimage.interpolation import map_coordinates
 
-import network
-
-#source activate ...
-#export PYTHONPATH=/home/tom/Downloads/flownet2-master/python:$PYTHONPATH
-#export PYTHONPATH=/home/tom/Documents/PythonProjects/VST/flownet2-master/python:$PYTHONPATH
-#echo $PYTHONPATH
 
 class VideoStyleTransferModule:
   
   def __init__(self, 
-               content, style, 
+               content, style, flow_path,
                alpha=1, beta=0.1, gamma=200,
-               frame_size=None,#[120, 160], #None
-               precalc_flow=None,
-               num_iters=50, pyramid_layers=4, opt_type='scipy',
-               inpaint=None,
+               num_iters=700, pyramid_layers=2, opt_type='scipy',
+               external_flow=False, gpu_id=0,
                model_path='Models/imagenet-vgg-verydeep-19.mat'):
     
     self.imgnet_mean = np.array([123.68, 116.779, 103.939])
     self.num_layers = 36
-    self.frame_size = frame_size
-    self.external_flow = False
     
     self.content_raw = []
     self.content_images = []
     self.style_image = []
     
-    if self.external_flow:
+    if external_flow is True:
       self.server = network.network()
       self.server.host_setup()
       self.server.host_connect()
@@ -76,11 +68,10 @@ class VideoStyleTransferModule:
 
     self.input_image = np.empty(self.image_shape)
 
-    # optical flow (PWC Net)
-    #pwc_model_path = os.getcwd() + '/PWC_Net/model_3000epoch/model_3007.ckpt'
-    #self.pwc_net = pwc.PWC(self.image_shape, pwc_model_path)
-
     # temporal
+    self.flow_path = flow_path
+    self.flow_shape = self.content_images[0].shape[1:3]
+    self.external_flow = external_flow
     
     self.J = [1, 2, 4]
     self.c_long = [np.zeros(self.weight_shape) for _ in self.J]
@@ -95,7 +86,7 @@ class VideoStyleTransferModule:
     self.weight_image = []
 
     # image pyramid
-    self.pyramid_layers = pyramid_layers#5
+    self.pyramid_layers = pyramid_layers
     self.p_shapes = self.pyramid_shapes(self.image_shape[1:3])
     self.p_style = self.image_pyramid(self.style_image)
     
@@ -111,7 +102,6 @@ class VideoStyleTransferModule:
     
     self.num_iters = [num_iters for i in range(self.pyramid_layers)] #*(i + 1)
     self.opt_type = opt_type
-    self.inpaint = inpaint
     
     # style transfer
     self.tf_x_ph = []
@@ -137,13 +127,17 @@ class VideoStyleTransferModule:
     
     # graph construction: for every pyramid layer we construct a separate graph
     self.tf_graphs = [tf.Graph() for _ in range(self.pyramid_layers)]
-    self.tf_config = tf.ConfigProto()#allow_soft_placement=True, 
-    self.tf_config.gpu_options.visible_device_list= '0'
+    self.tf_config = tf.ConfigProto()#allow_soft_placement=True,
+    
+    if gpu_id == 0:
+      self.tf_config.gpu_options.visible_device_list= '0'
     
     for i, g in enumerate(self.tf_graphs):
       with g.as_default():
         self.tf_init_graph(tf_shape=self.p_shapes[i], 
-                           alpha=self.alpha[i], beta=self.beta[i], gamma=self.gamma[i], 
+                           alpha=self.alpha[i], 
+                           beta=self.beta[i], 
+                           gamma=self.gamma[i], 
                            iters=self.num_iters[i])
           
     self.tf_sess = [tf.Session(graph=g, config=self.tf_config) for g in self.tf_graphs]
@@ -223,14 +217,34 @@ class VideoStyleTransferModule:
     
   def gram_matrix(self, mat):
     
-    b, h, w, c = mat.get_shape()#batch size 2 mit content und style
+    b, h, w, c = mat.get_shape()
     F = tf.reshape(mat, (h*w, c))
-    #F = F - tf.reduce_mean(F, axis=0, keepdims=True)
     G = tf.matmul(tf.transpose(F), F) / int(h*w)
     
     return G
   
   # Video Style Transfer Functions ============================================
+  
+  def queue_flows(self, idx):
+    
+    flow_queue = [self.content_raw[idx + 1]]
+    print('main idx: ', idx + 1)
+  
+    for j in self.J:
+        if (idx + 1) >= j:
+          print('idx: ', idx + 1 - j)
+          flow_queue.append(self.content_raw[idx + 1 - j])
+    
+    self.server.send_images(flow_queue)
+  
+  def recv_flows(self, past_frames):
+    
+    num_flows = len(past_frames)
+    flo_shape = (2*num_flows,) + self.image_shape[1:3] + (2,)
+    print(flo_shape)
+    rev_flows = self.server.recv_images(flo_shape, np.float32)
+    
+    return rev_flows[:num_flows], rev_flows[num_flows:]
   
   def warp(self, A, flow):
     
@@ -250,7 +264,7 @@ class VideoStyleTransferModule:
     
     return warped.reshape(A.shape)
   
-  def mid_term_weights(self, w_warp, w_back):
+  def temporal_weights(self, w_warp, w_back):
     
     weights = np.ones(w_warp.shape[:2])
     
@@ -276,39 +290,20 @@ class VideoStyleTransferModule:
     warp_flows = []
     
     for i, past_frame in enumerate(past_frames):
-      
-      #forward_flow, backward_flow = of.optical_flow(frame, past_frame)
-      forward_flow, backward_flow = of.optical_flow_pre(frame, past_frame)
-      #forward_flow = self.flow_forward[i]
-      #backward_flow = self.flow_backward[i]
 
-      '''
-      f1 = self.postp_image(self.content_images[frame])
-      f2 = self.postp_image(self.content_images[past_frame])
-      
-      imgs = [f2, f1]
-      
-      img_height = f1.shape[0]
-      img_width = f1.shape[1]
-      
-      img_shape = (img_height, img_width, 3)
-      flo_shape = (img_height, img_width, 2)
-      
-      self.server.send_images(imgs)
-      rev_imgs = self.server.recv_images(flo_shape, np.float32)
-      
-      forward_flow = rev_imgs[0]
-      
-      imgs = [f1, f2]
-      self.server.send_images(imgs)
-      rev_imgs = self.server.recv_images(flo_shape, np.float32)
-      backward_flow = rev_imgs[0]
-      '''
+      if self.external_flow is True:
+        forward_flow = self.flow_forward[i]
+        backward_flow = self.flow_backward[i]
+      else:
+        forward_flow, backward_flow = of.optical_flow_pre(self.flow_path, 
+                                                          frame, 
+                                                          past_frame, 
+                                                          self.flow_shape)
       
       warped_flow = self.warp(forward_flow, backward_flow)
       warp_flows.append(backward_flow)
       
-      new_c = self.mid_term_weights(warped_flow, backward_flow)
+      new_c = self.temporal_weights(warped_flow, backward_flow)
       long_term = new_c.copy()
 
       for c in mid_term:
@@ -324,9 +319,12 @@ class VideoStyleTransferModule:
   # Tensorflow Functions ======================================================
 
   def tf_init_graph(self, tf_shape, alpha, beta, gamma, iters):
+    
     ph_shape = (1,) + tf_shape + (3,)
     ph_shape_c = (1,) + tf_shape + (1,)
-    print(ph_shape, 'alpha', alpha, 'beta', beta, 'gamma', gamma, 'iters', iters)
+    
+    print(ph_shape, 
+          'alpha', alpha, 'beta', beta, 'gamma', gamma, 'iters', iters)
     
     self.tf_x_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
     self.tf_x_va.append(tf.Variable(self.tf_x_ph[-1], 
@@ -336,8 +334,8 @@ class VideoStyleTransferModule:
     self.tf_p_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
     self.tf_a_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
     
-    self.tf_w_ph.append(tf.placeholder(tf.float32, shape=ph_shape))# for _ in self.J]
-    self.tf_c_ph.append(tf.placeholder(tf.float32, shape=ph_shape_c))# for _ in self.J]
+    self.tf_w_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
+    self.tf_c_ph.append(tf.placeholder(tf.float32, shape=ph_shape_c))
     
     content_layer = ['relu4_2']
     style_layer = ['relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1']
@@ -356,7 +354,6 @@ class VideoStyleTransferModule:
     G = [self.gram_matrix(X[l]) for l in (style_layer)]
     
     content_weights = [1e0]
-    #style_weights = [0.2/n**2 for n in [64,128,256,512,512]]
     style_weights = [1e3/n**2 for n in [64,128,256,512,512]]
     
     self.L_content.append(0.0)
@@ -371,26 +368,24 @@ class VideoStyleTransferModule:
     for l, n in enumerate(style_layer):
       self.L_style[-1] += style_weights[l]*tf.reduce_mean((G[l] - A[l])**2.0)
       
-    # temporal loss
-    #for l, n in enumerate(self.J):
-    #  self.L_temporal[-1] += tf.reduce_mean(tf.multiply(self.tf_cl[i], (self.x - self.tf_warp[i])**2.0))
-    self.L_temporal[-1] = tf.reduce_mean(tf.multiply(self.tf_c_ph[-1], (self.tf_x_va[-1] - self.tf_w_ph[-1])**2.0))
+    self.L_temporal[-1] = tf.reduce_mean(tf.multiply(self.tf_c_ph[-1], 
+                                   (self.tf_x_va[-1] - self.tf_w_ph[-1])**2.0))
       
     # total loss
-    self.L_total.append(alpha*self.L_content[-1] + beta*self.L_style[-1] + gamma*self.L_temporal[-1])
+    self.L_total.append(alpha*self.L_content[-1] + 
+                        beta*self.L_style[-1] + 
+                        gamma*self.L_temporal[-1])
     
     # optimizer
-    self.tf_options.append({'maxiter': iters, 'disp': False})#, 'ftol': 0.0001
-    
-    #self.test_grad.append(tf.gradient(self.L_total[-1], self.tf_x_va[-1]))
+    self.tf_options.append({'maxiter': iters, 'disp': False, 'ftol': 0.0001})
     
     if self.opt_type is 'scipy':
       opt = tf.contrib.opt.ScipyOptimizerInterface(self.L_total[-1], 
                                                    method='L-BFGS-B', 
                                                    options=self.tf_options[-1])
     elif self.opt_type is 'tf':
-      opt = tf.train.MomentumOptimizer(1e2, 0.9, use_nesterov=True
-                                       ).minimize(self.L_total[-1])
+      opt = tf.train.MomentumOptimizer(1e2, 0.9, use_nesterov=True).minimize(self.L_total[-1])
+      
     self.tf_optimizer.append(opt)
     self.tf_initializer.append(tf.global_variables_initializer())
     
@@ -403,10 +398,6 @@ class VideoStyleTransferModule:
       
     self.tf_sess[layer].run(self.tf_initializer[layer], 
                             {self.tf_x_ph[layer]: self.input_image})
-    
-    #g_test = self.tf_sess[layer].run(self.grad_test[layer])
-    #print(g_test.shape)
-    #imageio.imwrite('grad_test.png', self.postp_image(g_test))
     
     if self.opt_type is 'scipy':
       self.tf_optimizer[layer].minimize(self.tf_sess[layer], 
@@ -471,33 +462,11 @@ class VideoStyleTransferModule:
       for i, ip in enumerate(inp):
         cont[p][i] = self.resize_bicubic(ip, shape)
         
-    return cont
-    
-  def queue_flows(self, idx):
-    
-    flow_queue = [self.content_raw[idx + 1]]
-    print('main idx: ', idx + 1)
-  
-    for j in self.J:
-        if (idx + 1) >= j:
-          print('idx: ', idx + 1 - j)
-          flow_queue.append(self.content_raw[idx + 1 - j])
-    
-    self.server.send_images(flow_queue)
-  
-  def recv_flows(self, past_frames):
-    
-    num_flows = len(past_frames)
-    flo_shape = (2*num_flows,) + self.image_shape[1:3] + (2,)
-    print(flo_shape)
-    rev_flows = self.server.recv_images(flo_shape, np.float32)
-    
-    return rev_flows[:num_flows], rev_flows[num_flows:]
-    
+    return cont    
     
   # Main ======================================================================
 
-  def optimize_images(self, cshape=None, multipass=True, init=False):
+  def optimize_images(self):
     
     print('optimize_start')
     
@@ -525,11 +494,7 @@ class VideoStyleTransferModule:
       
       self.p_content = self.image_pyramid(self.content_image)
       #I_rand = self.prep_image(np.random.normal(0, 128, self.p_content[-1].shape[1:]))
-      self.input_image = self.p_content[-1]#I_rand#
-      #if i == 0:
-      #  self.input_image = self.p_content[-1]#I_rand#
-      #else:
-      #  self.input_image = self.x_w[0]
+      self.input_image = self.p_content[-1]
       
       self.w = self.resize_whole(self.w, self.x_w)
       self.c = self.resize_whole(self.c, self.c_long)
@@ -541,7 +506,7 @@ class VideoStyleTransferModule:
         wrp = self.w[p_layer]
         nor = self.c[p_layer]
         
-        inv = 1.0 - np.sum(nor, axis=0) #shape?
+        inv = 1.0 - np.sum(nor, axis=0)
         self.input_image = self.resize_bicubic(self.input_image, p_shape)*inv
         
         for l, w in enumerate(wrp):
@@ -549,6 +514,7 @@ class VideoStyleTransferModule:
           
         self.content_image = self.p_content[p_layer]
         self.style_image = self.p_style[p_layer]
+        
         self.warped_image = self.input_image.copy()
         self.weight_image = 1.0 - np.reshape(inv, (1,) + inv.shape)
         
@@ -557,13 +523,13 @@ class VideoStyleTransferModule:
         #imageio.imsave((os.getcwd() + '/output/pyr_%04d' % f_idx) + '_' + str(k) + '.png', self.postp_image(styled))
       
       styled_images.append(styled)
-      imageio.imsave((self.output_dir + '/styled_%04d.png' % f_idx), self.postp_image(styled)) #am ende erst?
+      imageio.imsave((self.output_dir + '/styled_%04d.png' % f_idx), self.postp_image(styled))
       
       past_frames = []
       past_styled = []
       
       for j in self.J:
-        if (i + 1) >= j and not init:
+        if (i + 1) >= j:
           past_frames.append(frame_indices[i + 1 - j])
           past_styled.append(styled_images[i + 1 - j])
           print('past:', frame_indices[i + 1 - j], 'styled:', i + 1 - j)
@@ -577,5 +543,11 @@ class VideoStyleTransferModule:
     
     print(calc_times)
     print(np.sum(np.array(calc_times)))
-    return styled_images
+    
+    styled_frames = []
+    
+    for I_s in styled_images:
+      styled_frames.append(self.postp_image(I_s))
+    
+    return styled_frames
 

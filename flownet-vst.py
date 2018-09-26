@@ -5,13 +5,10 @@ from __future__ import print_function
 import os
 import time
 import caffe
+import network
 import tempfile
 import numpy as np
 from math import ceil
-
-import network
-from flow_utils import vis_flow
-import imageio
 
 #python run-flownet.py /home/schrotter/ICG-Projects/flownet2/models/FlowNet2/FlowNet2_weights.caffemodel.h5 /home/schrotter/ICG-Projects/flownet2/models/FlowNet2/FlowNet2_deploy.prototxt.template frame_0001.png frame_0002.png c_test.flo
 
@@ -27,12 +24,10 @@ path_flownet = os.getcwd() + '/flownet2/models/FlowNet2/'
 path_caffemodel = path_flownet + 'FlowNet2_weights.caffemodel.h5'
 path_deployproto = path_flownet + 'FlowNet2_deploy.prototxt.template'
 
-#path_flownet = os.getcwd() + '/flownet2/models/FlowNet2-CS/'
-#path_caffemodel = path_flownet + 'FlowNet2-CS_weights.caffemodel'
-#path_deployproto = path_flownet + 'FlowNet2-CS_deploy.prototxt.template'
-
 image_width = 512#256#160#512#128#1024
 image_height = 384#192#120#384#96#436
+
+J = [2, 3, 3, 4] #num of images to be transmitted
 
 img_shape = (image_height, image_width, 3)
 flo_shape = (image_height, image_width, 2)
@@ -84,9 +79,6 @@ def load_input(img0, img1):
 
   input_data = []
   
-  #img0 = scipy.misc.imread('c1.png')
-  #img1 = scipy.misc.imread('c2.png')
-  
   if len(img0.shape) < 3: 
     input_data.append(img0[np.newaxis, np.newaxis, :, :])
   else:                   
@@ -102,8 +94,6 @@ def load_input(img0, img1):
     in_dict[net.inputs[blob_idx]] = input_data[blob_idx]
     
   return in_dict
-
-#load_input(test_image, test_image) #pre allocation
 
 def optical_flow_calculation(im1, im2):
   time_start = time.time()
@@ -145,7 +135,6 @@ def optical_flow_calculation(im1, im2):
 # main ========================================================================
 
 optical_flow_calculation(test_image, test_image) #pre allocation
-J = [2, 3, 3, 4] #num of images to be transmitted
 client = network.network()
 
 try:
