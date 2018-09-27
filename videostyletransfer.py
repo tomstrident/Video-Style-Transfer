@@ -23,7 +23,7 @@ class VideoStyleTransferModule:
                alpha=1, beta=0.1, gamma=200,
                num_iters=700, pyramid_layers=2, opt_type='scipy',
                external_flow=False, gpu_id=0,
-               model_path='Models/imagenet-vgg-verydeep-19.mat'):
+               model_path='models/imagenet-vgg-verydeep-19.mat'):
     
     self.imgnet_mean = np.array([123.68, 116.779, 103.939])
     self.num_layers = 36

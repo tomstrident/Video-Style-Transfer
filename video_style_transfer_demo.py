@@ -8,9 +8,11 @@ import scipy.misc
 import numpy as np
 import videostyletransfer as vst
 
-content_path = os.getcwd() + '/input/temple_2/'
+video_id = 'temple_2'
+
+content_path = os.getcwd() + '/input/' + video_id + '/'
 style_path = os.getcwd() + '/style-images/starry_night.jpg'
-flow_path = os.getcwd() + '/flow/temple_2/'
+flow_path = os.getcwd() + '/flow/' + video_id + '/'
 
 height = 384#192#96#384#436
 width = 512#256#128#512#1024
@@ -29,7 +31,7 @@ style = np.array(style)
 vst_module = vst.VideoStyleTransferModule(content, style, flow_path)
 styled_frames = vst_module.optimize_images()
 
-writer = imageio.get_writer(os.getcwd() + '/output/temple_2.mp4', fps=30)
+writer = imageio.get_writer(os.getcwd() + '/output/' + video_id + '/' + video_id + '.mp4', fps=30)
 
 for f in styled_frames:
     writer.append_data(f)

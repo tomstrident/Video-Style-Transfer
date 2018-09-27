@@ -7,7 +7,7 @@ A demo file `video_style_transfer_demo.py` is provided.
 ## Requirements:
 * Tensorflow (tested with 1.7.0)
 * numpy, scipy, imageio, OpenCV3
-* [VGG19 model](http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat)
+* [imagenet VGG19 model](http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat)
 
 ## Install:
 After downloading the imagenet VGG19 model via the command 
@@ -19,7 +19,7 @@ you can run the demo file
     python video_style_transfer_demo.py
 
 The demo just processes 5 frames of a video from the [Sintel Dataset](http://sintel.is.tue.mpg.de/) and uses pre-computed flow files which were generated using [DeepFlow2](https://thoth.inrialpes.fr/src/deepflow/).
-If you want to compute your own videos you have to generate your own flow files. In `other` you can find a script `create_flow_list.py` that generates an input list for DeepFlow2 to automatically compute flow files for you. Before doing so please install [DeepFlow2](https://thoth.inrialpes.fr/src/deepflow/) and adjust the file `create_flow_list.py` accordingly.
+If you want to compute your own videos you have to generate your own flow files. The script `generate_deepflow_script.py` generates a script for DeepFlow2 to automatically compute flow files for you. Before doing so please install [DeepFlow2](https://thoth.inrialpes.fr/src/deepflow/) and adjust the file `generate_deepflow_script.py` accordingly.
 Alternatively you can use any other optical flow framework of your choice. In order to prevent version conflicts (Python, Tensorflow, etc.) I provide a script `network.py` that allows you to communicate between the environment of Video Style Transfer application and any other optical flow framework environment.
 I have included an example file `flownet-vst.py` that shows how to use [FlowNet2](https://github.com/lmb-freiburg/flownet2) within Video Style Transfer. Since FlowNet2 uses Python 2.7 you have to run it in a separate console with a Python 2.7 environment. Before running `flownet-vst.py` you have to set `$PYTHONPATH` accordingly. For example
 
@@ -29,11 +29,11 @@ In the `flownet-vst.py` file you have to modify line 23
 
     path_flownet = '/home/tom/Downloads/flownet2-master/models/FlowNet2/'
 
-accordingly to your folder locations. Then you can start the main file
+accordingly to your folder locations. Then you can start the main file in the first console
 
     python video_style_transfer_demo.py
 
-followed by the secondary file
+followed by the secondary file in the second console
 
     python flownet-vst.py
 
