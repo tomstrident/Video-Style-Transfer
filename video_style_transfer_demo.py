@@ -18,6 +18,7 @@ height = 384#192#96#384#436
 width = 512#256#128#512#1024
 
 num_frames = 5
+fps = 30
 
 content = []
 for i in range(1, num_frames + 1):
@@ -31,9 +32,10 @@ style = np.array(style)
 vst_module = vst.VideoStyleTransferModule(content, style, flow_path)
 styled_frames = vst_module.optimize_images()
 
-writer = imageio.get_writer(os.getcwd() + '/output/' + video_id + '/' + video_id + '.mp4', fps=30)
+vid_id = os.getcwd() + '/output/' + video_id + '.mp4'
+writer = imageio.get_writer(vid_id, fps=fps)
 
 for f in styled_frames:
-    writer.append_data(f)
+  writer.append_data(f)
     
 writer.close()

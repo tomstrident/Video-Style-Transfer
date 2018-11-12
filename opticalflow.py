@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import numpy as np
 from matplotlib.colors import hsv_to_rgb
@@ -7,7 +5,6 @@ from matplotlib.colors import hsv_to_rgb
 def read_flow_file(path):
   
   flow_data = []
-  tag_float = 202021.25
     
   with open(path, 'r') as fid:
     
@@ -15,8 +12,8 @@ def read_flow_file(path):
     w = np.fromfile(fid, np.int32, count=1)[0]
     h = np.fromfile(fid, np.int32, count=1)[0]
     
-    if(tag != tag_float):
-      print('error')
+    if(tag != 202021.25):
+      print('error: no flow file')
     
     data = np.fromfile(fid, np.float32, count=2*h*w)
     flow_data = np.resize(data, (h, w, 2))
@@ -45,17 +42,3 @@ def visualize_flow(flow):
   hsv[...,2] = normalize(rho)
   
   return hsv_to_rgb(hsv)
-
-def optical_flow_pre(flow_path, image_A, image_B, flow_shape):
-  
-  forward_path = flow_path + 'frame_%04d-%04d.flo' % (image_B, image_A)
-  backward_path = flow_path + 'frame_%04d-%04d.flo' % (image_A, image_B)
-  
-  forward_flow = read_flow_file(forward_path)
-  backward_flow = read_flow_file(backward_path)
-  
-  height = flow_shape[0]
-  width = flow_shape[1]
-    
-  return forward_flow[:height,:width,:], backward_flow[:height,:width,:]
-

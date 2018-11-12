@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 
 import os
 import cv2
 import time
 import imageio
 
-import network
 import numpy as np
 import tensorflow as tf
 import opticalflow as of
@@ -14,30 +12,39 @@ import opticalflow as of
 from scipy.io import loadmat
 #from diffusion_inpainting import image_diffusion
 from scipy.ndimage.interpolation import map_coordinates
+from threading import Barrier, Event, Thread
 
+import network
+
+#source activate ...
+#export PYTHONPATH=/home/tom/Downloads/flownet2-master/python:$PYTHONPATH
+#export PYTHONPATH=/home/tom/Documents/PythonProjects/VST/flownet2-master/python:$PYTHONPATH
+#echo $PYTHONPATH
 
 class VideoStyleTransferModule:
   
   def __init__(self, 
                content, style, flow_path,
-               alpha=1, beta=0.1, gamma=200,
-               num_iters=700, pyramid_layers=2, opt_type='scipy',
-               external_flow=False, gpu_id=0,
-               model_path='models/imagenet-vgg-verydeep-19.mat'):
+               alpha=1, beta=1, gamma=200,
+               external_flow=False, show_info=False,
+               num_iters=3000, pyramid_layers=4, opt_type='scipy',
+               inpaint=None, eps=1e1, reduce_layers=True,
+               model_path='Models/imagenet-vgg-verydeep-19.mat'):
     
     self.imgnet_mean = np.array([123.68, 116.779, 103.939])
     self.num_layers = 36
+    self.flow_path = flow_path
+    self.external_flow = external_flow
+    self.show_info = show_info
     
     self.content_raw = []
     self.content_images = []
     self.style_image = []
     
-    if external_flow is True:
+    if self.external_flow:
       self.server = network.network()
       self.server.host_setup()
       self.server.host_connect()
-    
-    #self.tf_def_sess = tf.Session()
     
     if type(content) is str:
       reader = imageio.get_reader(content)
@@ -65,18 +72,20 @@ class VideoStyleTransferModule:
     
     self.image_shape = self.content_images[0].shape
     self.weight_shape = self.image_shape[:3] + (1,)
+    self.flow_shape = self.image_shape[1:3] + (2,)
 
     self.input_image = np.empty(self.image_shape)
 
     # temporal
-    self.flow_path = flow_path
-    self.flow_shape = self.content_images[0].shape[1:3]
-    self.external_flow = external_flow
-    
     self.J = [1, 2, 4]
+    self.c_mid = [np.zeros(self.weight_shape) for _ in self.J]
     self.c_long = [np.zeros(self.weight_shape) for _ in self.J]
     self.x_w = [np.zeros(self.image_shape) for _ in self.J]
     
+    self.forward_flows = [np.zeros(self.flow_shape) for _ in self.J]
+    self.backward_flows = [np.zeros(self.flow_shape) for _ in self.J]
+    self.warped_flows = [np.zeros(self.flow_shape) for _ in self.J]
+
     self.past_frames = []
     self.past_styled = []
     self.flow_forward = []
@@ -100,18 +109,45 @@ class VideoStyleTransferModule:
     self.beta = [beta for i in range(self.pyramid_layers)]
     self.gamma = [gamma for i in range(self.pyramid_layers)]
     
-    self.num_iters = [num_iters for i in range(self.pyramid_layers)] #*(i + 1)
+    self.num_iters = [num_iters for i in range(self.pyramid_layers)]
+    #self.num_iters = [4, 14, 34]
+    #self.num_iters = [2, 7, 17]
     self.opt_type = opt_type
+    self.inpaint = inpaint
     
-    # style transfer
-    self.tf_x_ph = []
-    self.tf_x_va = []
+    # multithreading
+    self.t_num = 2*len(self.J)
+    self.t_stop = Event()
+    self.t_bar = Barrier(self.t_num + 1)
+    self.threads = []
+    
+    for tid in range(self.t_num):
+      t_arg = (tid % 3, self.t_stop, self.t_bar)
+      if tid < 3:
+        self.threads.append(Thread(target=self.t_warp_flows, args=t_arg))
+      else:
+        self.threads.append(Thread(target=self.t_warp_styled, args=t_arg))
+      self.threads[-1].start()
 
+    # style transfer
+    self.content_layer = ['relu4_2']
+    
+    if reduce_layers:
+      self.style_layer = ['relu3_1']
+    else:
+      self.style_layer = ['relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1']
+
+    self.tf_x_ph = []
     self.tf_p_ph = []
     self.tf_a_ph = []
-    
     self.tf_w_ph = []
     self.tf_c_ph = []
+
+    self.tf_x_va = []
+    self.tf_p_va = []
+    self.tf_a_va = []
+    self.tf_w_va = []
+    self.tf_c_va = []
     
     self.L_content = []
     self.L_style = []
@@ -119,29 +155,41 @@ class VideoStyleTransferModule:
     self.L_total = []
     
     # optimizer
+    #self.eps = [1e1, 1e0, 1e-1, 1e-2]
+    self.eps = [eps for _ in range(self.pyramid_layers)]
     self.tf_options = []
     self.tf_optimizer = []
     self.tf_initializer = []
     
     self.vgg_data = self.load_network_data(model_path)
     
+    # stats
+    self.ipo = [[] for _ in range(self.pyramid_layers)] # iterations per optimization
+    self.tpo = [[] for _ in range(self.pyramid_layers)] # time per optimization
+    self.ips = [[] for _ in range(self.pyramid_layers)] # iterations per second
+    self.tpt = [] # total process time
+
     # graph construction: for every pyramid layer we construct a separate graph
     self.tf_graphs = [tf.Graph() for _ in range(self.pyramid_layers)]
-    self.tf_config = tf.ConfigProto()#allow_soft_placement=True,
-    
-    if gpu_id == 0:
-      self.tf_config.gpu_options.visible_device_list= '0'
+    self.tf_config = tf.ConfigProto()#allow_soft_placement=True, 
+    self.tf_config.gpu_options.visible_device_list= '0'
     
     for i, g in enumerate(self.tf_graphs):
       with g.as_default():
         self.tf_init_graph(tf_shape=self.p_shapes[i], 
-                           alpha=self.alpha[i], 
-                           beta=self.beta[i], 
-                           gamma=self.gamma[i], 
-                           iters=self.num_iters[i])
+                           alpha=self.alpha[i], beta=self.beta[i], gamma=self.gamma[i], 
+                           iters=self.num_iters[i], eps=self.eps[i])
           
     self.tf_sess = [tf.Session(graph=g, config=self.tf_config) for g in self.tf_graphs]
 
+  def __del__(self):
+    print('del called')
+    #self.exit_threads()
+
+  #def __exit__(self, exc_type, exc_value, traceback):
+  #  print('exit called')
+  #  self.exit_threads()
+    
   # Basic Style Transfer Functions ============================================
   
   def prep_image(self, image):
@@ -225,46 +273,17 @@ class VideoStyleTransferModule:
   
   # Video Style Transfer Functions ============================================
   
-  def queue_flows(self, idx):
-    
-    flow_queue = [self.content_raw[idx + 1]]
-    print('main idx: ', idx + 1)
-  
-    for j in self.J:
-        if (idx + 1) >= j:
-          print('idx: ', idx + 1 - j)
-          flow_queue.append(self.content_raw[idx + 1 - j])
-    
-    self.server.send_images(flow_queue)
-  
-  def recv_flows(self, past_frames):
-    
-    num_flows = len(past_frames)
-    flo_shape = (2*num_flows,) + self.image_shape[1:3] + (2,)
-    print(flo_shape)
-    rev_flows = self.server.recv_images(flo_shape, np.float32)
-    
-    return rev_flows[:num_flows], rev_flows[num_flows:]
-  
-  def warp(self, A, flow):
+  def warp(self, A, flow, shape):
     
     assert A.shape[-3:-1] == flow.shape[-3:-1], "dimension error: input and \
                                                  flow size do not match"
     h, w = flow.shape[:2]
-    c = A.shape[-1]
-    
-    x = (flow[...,0] + np.arange(w)).ravel()
-    y = (flow[...,1] + np.arange(h)[:,np.newaxis]).ravel()
-    
-    warped = np.empty((h, w, c))
-    
-    for i in range(c):
-      R = A[...,i].reshape((h, w))
-      warped[...,i] = map_coordinates(R, [y, x]).reshape((h, w))
-    
-    return warped.reshape(A.shape)
-  
-  def temporal_weights(self, w_warp, w_back):
+    x = (flow[...,0] + np.arange(w)).astype(A.dtype)
+    y = (flow[...,1] + np.arange(h)[:,np.newaxis]).astype(A.dtype)
+
+    return cv2.remap(A, x, y, cv2.INTER_LINEAR).reshape(shape)
+
+  def mid_term_weights(self, w_warp, w_back):
     
     weights = np.ones(w_warp.shape[:2])
     
@@ -282,76 +301,113 @@ class VideoStyleTransferModule:
     weights[np.where(disoccluded_regions)] = 0
     weights[np.where(motion_boundaries)] = 0
     
-    return weights
-  
-  def long_term_weights(self, frame, past_frames):
-    
-    mid_term = []
-    warp_flows = []
-    
-    for i, past_frame in enumerate(past_frames):
+    return weights.reshape(self.weight_shape)
 
-      if self.external_flow is True:
-        forward_flow = self.flow_forward[i]
-        backward_flow = self.flow_backward[i]
-      else:
-        forward_flow, backward_flow = of.optical_flow_pre(self.flow_path, 
-                                                          frame, 
-                                                          past_frame, 
-                                                          self.flow_shape)
+  def acquire_optical_flows(self, frame, past_frames):
+    
+    h, w = self.flow_shape[0:2]
+
+    for i, past_frame in enumerate(past_frames):
       
-      warped_flow = self.warp(forward_flow, backward_flow)
-      warp_flows.append(backward_flow)
+      forward_path = self.flow_path + 'frame_%04d-%04d.flo' % (past_frame, frame)
+      backward_path = self.flow_path + 'frame_%04d-%04d.flo' % (frame, past_frame)
       
-      new_c = self.temporal_weights(warped_flow, backward_flow)
+      forward_flow = of.read_flow_file(forward_path)
+      backward_flow = of.read_flow_file(backward_path)
+      
+      self.forward_flows[i] = forward_flow[:h,:w,:]
+      self.backward_flows[i] = backward_flow[:h,:w,:]
+      
+    return self.forward_flows, self.backward_flows
+
+  def warp_optical_flows(self, forward_flows, backward_flows):
+    
+    for i, _ in enumerate(self.past_styled):
+      self.warped_flows[i] = self.warp(forward_flows[i], backward_flows[i])
+      
+    return self.warped_flows
+
+  def warp_past_styled(self, past_styled, backward_flows):
+
+    for j, _ in enumerate(self.past_styled):
+      self.x_w[j] = self.warp(self.past_styled[j], self.backward_flows[j])
+      #imageio.imsave((os.getcwd() + '/output/warp_%04d' % f_idx) + '_' + str(j) + '.png', self.postp_image(self.x_w[j]))
+      
+    return self.x_w
+  
+  def compute_c_mid(self, warped_flows, backward_flows):
+  
+    for i, _ in enumerate(self.past_styled):
+      self.c_mid[i] = self.mid_term_weights(warped_flows[i], backward_flows[i])
+      
+    return self.c_mid
+    
+  def compute_c_long(self, c_mid):
+  
+    c_temp = []
+  
+    for i, _ in enumerate(self.past_styled):
+      self.c_long[i] = self.c_mid[i].copy()
+      
+      for c in c_temp:
+        self.c_long[i] -= c
+        
+      self.c_long[i] = np.maximum(self.c_long[i], 0)
+      c_temp.append(self.c_mid[i])
+      
+    return self.c_long
+  
+  def compute_past_weights(self, warped_flows, backward_flows):
+  
+    mid_term = []
+    
+    for i, _ in enumerate(self.past_styled):
+      new_c = self.mid_term_weights(warped_flows[i], backward_flows[i])
       long_term = new_c.copy()
 
       for c in mid_term:
         long_term -= c
         
-      long_term[long_term < 0] = 0
+      long_term = np.maximum(long_term, 0)
 
       mid_term.append(new_c)
       self.c_long[i] = long_term.reshape((1,) + long_term.shape + (1,))
-    
-    return warp_flows
+      
+    return self.c_long
 
   # Tensorflow Functions ======================================================
 
-  def tf_init_graph(self, tf_shape, alpha, beta, gamma, iters):
-    
+  def tf_init_graph(self, tf_shape, alpha, beta, gamma, iters, eps):
+
     ph_shape = (1,) + tf_shape + (3,)
     ph_shape_c = (1,) + tf_shape + (1,)
-    
-    print(ph_shape, 
-          'alpha', alpha, 'beta', beta, 'gamma', gamma, 'iters', iters)
+
+    print(ph_shape, 'alpha', alpha, 'beta', beta, 'gamma', gamma, 'iters', iters, 'eps', eps)
     
     self.tf_x_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
-    self.tf_x_va.append(tf.Variable(self.tf_x_ph[-1], 
-                                    trainable=True, 
-                                    dtype=tf.float32))
-
     self.tf_p_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
     self.tf_a_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
-    
     self.tf_w_ph.append(tf.placeholder(tf.float32, shape=ph_shape))
     self.tf_c_ph.append(tf.placeholder(tf.float32, shape=ph_shape_c))
     
-    content_layer = ['relu4_2']
-    style_layer = ['relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1']
-    
+    self.tf_x_va.append(tf.Variable(self.tf_x_ph[-1], trainable=True, dtype=tf.float32))
+    self.tf_p_va.append(tf.Variable(self.tf_p_ph[-1], trainable=False, dtype=tf.float32))
+    self.tf_a_va.append(tf.Variable(self.tf_a_ph[-1], trainable=False, dtype=tf.float32))
+    self.tf_w_va.append(tf.Variable(self.tf_w_ph[-1], trainable=False, dtype=tf.float32))
+    self.tf_c_va.append(tf.Variable(self.tf_c_ph[-1], trainable=False, dtype=tf.float32))
+        
     # content layer
-    P = self.vgg(self.vgg_data, self.tf_p_ph[-1])
-    P = [P[l] for l in content_layer]
+    P = self.vgg(self.vgg_data, self.tf_p_va[-1])
+    P = [P[l] for l in self.content_layer]
     
     # style layer
-    A = self.vgg(self.vgg_data, self.tf_a_ph[-1])
-    A = [self.gram_matrix(A[l]) for l in style_layer]
+    A = self.vgg(self.vgg_data, self.tf_a_va[-1])
+    A = [self.gram_matrix(A[l]) for l in self.style_layer]
     
     # input layer
     X = self.vgg(self.vgg_data, self.tf_x_va[-1])
-    F = [X[l] for l in (content_layer)]
-    G = [self.gram_matrix(X[l]) for l in (style_layer)]
+    F = [X[l] for l in (self.content_layer)]
+    G = [self.gram_matrix(X[l]) for l in (self.style_layer)]
     
     content_weights = [1e0]
     style_weights = [1e3/n**2 for n in [64,128,256,512,512]]
@@ -361,50 +417,57 @@ class VideoStyleTransferModule:
     self.L_temporal.append(tf.constant(0.0))
     
     # content loss
-    for l, n in enumerate(content_layer):
+    for l, n in enumerate(self.content_layer):
       self.L_content[-1] += content_weights[l]*tf.reduce_mean((F[l] - P[l])**2.0)
     
     # style loss
-    for l, n in enumerate(style_layer):
+    for l, n in enumerate(self.style_layer):
       self.L_style[-1] += style_weights[l]*tf.reduce_mean((G[l] - A[l])**2.0)
       
-    self.L_temporal[-1] = tf.reduce_mean(tf.multiply(self.tf_c_ph[-1], 
-                                   (self.tf_x_va[-1] - self.tf_w_ph[-1])**2.0))
+    # temporal loss
+    #for l, n in enumerate(self.J):
+    #  self.L_temporal[-1] += tf.reduce_mean(tf.multiply(self.tf_cl[i], (self.x - self.tf_warp[i])**2.0))
+    self.L_temporal[-1] = tf.reduce_mean(tf.multiply(self.tf_c_va[-1], (self.tf_x_va[-1] - self.tf_w_va[-1])**2.0))
       
     # total loss
-    self.L_total.append(alpha*self.L_content[-1] + 
-                        beta*self.L_style[-1] + 
-                        gamma*self.L_temporal[-1])
+    self.L_total.append(alpha*self.L_content[-1] + beta*self.L_style[-1] + gamma*self.L_temporal[-1])
     
     # optimizer
-    self.tf_options.append({'maxiter': iters, 'disp': False, 'ftol': 0.0001})
+    self.tf_options.append({'maxiter': iters, 'disp': False, 'ftol': 0.0001})#
     
     if self.opt_type is 'scipy':
       opt = tf.contrib.opt.ScipyOptimizerInterface(self.L_total[-1], 
                                                    method='L-BFGS-B', 
                                                    options=self.tf_options[-1])
     elif self.opt_type is 'tf':
-      opt = tf.train.MomentumOptimizer(1e2, 0.9, use_nesterov=True).minimize(self.L_total[-1])
-      
+      #opt = tf.train.MomentumOptimizer(1e-1, 0.9, use_nesterov=True).minimize(self.L_total[-1])
+      #elif self.opt_type is 'adam':
+      opt = tf.train.AdamOptimizer(1e1).minimize(self.L_total[-1])
+
     self.tf_optimizer.append(opt)
     self.tf_initializer.append(tf.global_variables_initializer())
     
-  def run(self, layer):
+  def run(self, layer, frame_iter):
     
     def callback(L, L_c, L_s, L_t, it=[0]):
       print('Iteration: %4d' % it[0], 
             'Total: %12g, Content: %12g, Style: %12g, Temporal: %12g' % (L, L_c, L_s, L_t))
       it[0] += 1
-      
+    
+    #init
+    i = 0
     self.tf_sess[layer].run(self.tf_initializer[layer], 
-                            {self.tf_x_ph[layer]: self.input_image})
+                            {self.tf_x_ph[layer]:self.input_image,
+                             self.tf_p_ph[layer]:self.content_image, 
+                             self.tf_a_ph[layer]:self.style_image,
+                             self.tf_w_ph[layer]:self.warped_image, 
+                             self.tf_c_ph[layer]:self.weight_image})
+    o1 = time.time()
+    iter_count = 0
     
     if self.opt_type is 'scipy':
+      iter_count = self.num_iters[layer]
       self.tf_optimizer[layer].minimize(self.tf_sess[layer], 
-                       feed_dict={self.tf_p_ph[layer]:self.content_image, 
-                                  self.tf_a_ph[layer]:self.style_image,
-                                  self.tf_w_ph[layer]:self.warped_image, 
-                                  self.tf_c_ph[layer]:self.weight_image},
                        fetches=[self.L_total[layer], 
                                 self.alpha[layer]*self.L_content[layer], 
                                 self.beta[layer]*self.L_style[layer],
@@ -412,12 +475,22 @@ class VideoStyleTransferModule:
                        loss_callback=callback)
       
     elif self.opt_type is 'tf':
+      
+      #while inter_time - start_time < 1.0:
       for i in range(self.num_iters[layer]):
+        
         loss, _ = self.tf_sess[layer].run([self.L_total[layer], 
-                                          self.tf_optimizer[layer]], 
-                                          feed_dict={self.tf_p_ph[layer]:self.content_image,
-                                                     self.tf_a_ph[layer]:self.style_image})
-        print(i, loss)
+                                          self.tf_optimizer[layer]])
+        print('Iteration:', i, 'Loss:', loss)
+        iter_count += 1
+
+    o2 = time.time()
+    
+    print('optimization time', o2 - o1, 'iterations', iter_count)
+    
+    self.tpo[layer].append(o2 - o1)
+    self.ipo[layer].append(iter_count)
+    self.ips[layer].append(iter_count/(o2 - o1))
 
     return self.tf_sess[layer].run(self.tf_x_va[layer])
 
@@ -462,92 +535,183 @@ class VideoStyleTransferModule:
       for i, ip in enumerate(inp):
         cont[p][i] = self.resize_bicubic(ip, shape)
         
-    return cont    
+    return cont
+    
+  def queue_flows(self, idx):
+    
+    flow_queue = [self.content_raw[idx + 1]]
+    print('main idx: ', idx + 1)
+  
+    for j in self.J:
+        if (idx + 1) >= j:
+          print('idx: ', idx + 1 - j)
+          flow_queue.append(self.content_raw[idx + 1 - j])
+    
+    self.server.send_images(flow_queue)
+  
+  def recv_flows(self, past_frames):
+    
+    num_flows = len(past_frames)
+    flo_shape = (2*num_flows,) + self.image_shape[1:3] + (2,)
+    print(flo_shape)
+    rev_flows = self.server.recv_images(flo_shape, np.float32)
+    
+    return rev_flows[:num_flows], rev_flows[num_flows:]
+
+  # Multithreading ============================================================
+
+  def t_warp_flows(self, tid, ctl, bar):
+    print('start flow thread', tid)
+    while True:
+      bar.wait()
+      
+      if ctl.is_set():
+        break
+      
+      if len(self.past_styled) > tid:
+        #print('go', tid)
+        self.warped_flows[tid] = self.warp(self.forward_flows[tid], self.backward_flows[tid], self.flow_shape)
+        self.c_mid[tid] = self.mid_term_weights(self.warped_flows[tid], self.backward_flows[tid])
+        bar.wait()
+    print('end flow thread', tid)
+    
+  def t_warp_styled(self, tid, ctl, bar):
+    print('start style thread', tid)
+    while True:
+      bar.wait()
+      
+      if ctl.is_set():
+        break
+      
+      if len(self.past_styled) > tid:
+        #print('go', tid)
+        self.x_w[tid] = self.warp(self.past_styled[tid][0], self.backward_flows[tid], self.image_shape)
+        #imageio.imsave((os.getcwd() + '/output/warp_%04d' % 1) + '_' + str(tid) + '.png', self.postp_image(self.x_w[tid]))
+        for p, shape in enumerate(self.p_shapes):
+          self.w[p][tid] = self.resize_bicubic(self.x_w[tid], shape)
+          
+        bar.wait()
+    print('end style thread', tid)
+    
+  def exit_threads(self):
+    print('exit_threads called')
+    self.t_stop.set()
+    self.t_bar.wait()
+    for t in self.threads:
+      t.join()
     
   # Main ======================================================================
 
-  def optimize_images(self):
+  def psnr(self, img1, img2):
+    mse = np.mean((self.postp_image(img1) - self.postp_image(img2))**2)
     
-    print('optimize_start')
+    if mse == 0:
+      return 100.0
+      
+    return 20*np.log10(255.0/np.sqrt(mse))
+
+  def optimize_images(self, cshape=None, multipass=True, init=False):
     
     styled_images = []
     past_frames = []
-    past_styled = []
-    calc_times = []
+    ref = []
+    #psnrs = []
 
     frame_indices = np.arange(len(self.content_images)) + 1
     
     for i, f_idx in enumerate(frame_indices):
       
+      #ref = imageio.imread(os.getcwd() + ('/ref/styled_%04d.png' % f_idx))
+      #ref = self.prep_image(ref)
+
       time_start = time.time()
       
       self.content_image = self.content_images[f_idx - 1]
+      self.p_content = self.image_pyramid(self.content_image)
+      self.input_image = self.p_content[-1]
       
       if i + 1 < len(frame_indices) and self.external_flow:
         self.queue_flows(i)
-        
-      flows = self.long_term_weights(f_idx, past_frames)
-
-      for j, x_p in enumerate(past_styled):
-        self.x_w[j] = self.warp(x_p, flows[j])
-        #imageio.imsave((os.getcwd() + '/output/warp_%04d' % f_idx) + '_' + str(j) + '.png', self.postp_image(self.x_w[j]))
+      else:
+        self.acquire_optical_flows(f_idx, past_frames)
       
-      self.p_content = self.image_pyramid(self.content_image)
-      #I_rand = self.prep_image(np.random.normal(0, 128, self.p_content[-1].shape[1:]))
-      self.input_image = self.p_content[-1]
+      t1 = time.time()
+      self.t_bar.wait()
+      self.t_bar.wait()
       
-      self.w = self.resize_whole(self.w, self.x_w)
+      t2 = time.time()
+      print('t21', t2 - t1)
+      
+      self.c_long = self.compute_c_long(self.c_mid)
       self.c = self.resize_whole(self.c, self.c_long)
       
+      t3 = time.time()
+      print('t32', t3 - t2)
+      print('t31', t3 - t1)
+
       for k, p_layer in enumerate(reversed(range(self.pyramid_layers))):
         
         p_shape = self.p_shapes[p_layer]
         
         wrp = self.w[p_layer]
         nor = self.c[p_layer]
-        
+
         inv = 1.0 - np.sum(nor, axis=0)
         self.input_image = self.resize_bicubic(self.input_image, p_shape)*inv
-        
+
         for l, w in enumerate(wrp):
           self.input_image += w*nor[l]
-          
+
         self.content_image = self.p_content[p_layer]
         self.style_image = self.p_style[p_layer]
-        
         self.warped_image = self.input_image.copy()
         self.weight_image = 1.0 - np.reshape(inv, (1,) + inv.shape)
         
-        styled = self.run(layer=p_layer)
+        s1 = time.time()
+        styled = self.run(layer=p_layer, frame_iter=i)
+        s2 = time.time()
+        print('style time', s2 - s1)
         self.input_image = styled.copy()
         #imageio.imsave((os.getcwd() + '/output/pyr_%04d' % f_idx) + '_' + str(k) + '.png', self.postp_image(styled))
       
       styled_images.append(styled)
+
+      t4 = time.time()
+      print('t43', t4 - t3)
+
       imageio.imsave((self.output_dir + '/styled_%04d.png' % f_idx), self.postp_image(styled))
       
       past_frames = []
-      past_styled = []
+      self.past_styled = []
       
       for j in self.J:
-        if (i + 1) >= j:
+        if (i + 1) >= j and not init:
           past_frames.append(frame_indices[i + 1 - j])
-          past_styled.append(styled_images[i + 1 - j])
+          self.past_styled.append(styled_images[i + 1 - j])
           print('past:', frame_indices[i + 1 - j], 'styled:', i + 1 - j)
       
       if i + 1 < len(frame_indices) and self.external_flow:
         self.flow_forward, self.flow_backward = self.recv_flows(past_frames)
       
       time_end = time.time()
+
+      #psnrs.append(self.psnr(ref, styled))
+
+      print('t4 end', time_end - t4)
       print('style calculation complete: ', time_end - time_start)
-      calc_times.append(time_end - time_start)
+      self.tpt.append(time_end - time_start)
     
-    print(calc_times)
-    print(np.sum(np.array(calc_times)))
-    
-    styled_frames = []
-    
-    for I_s in styled_images:
-      styled_frames.append(self.postp_image(I_s))
-    
-    return styled_frames
+    if self.show_info:
+      for i in range(self.pyramid_layers):
+        print('layer', str(i))
+        print('time per optimization', self.tpo[i], 'tpo avg', np.mean(np.array(self.tpo[i])))
+        print('iters per optimization', self.ipo[i], 'ipo avg', np.mean(np.array(self.ipo[i])))
+        print('iters per second', self.ips[i], 'ips avg', np.mean(np.array(self.ips[i])))
+
+      print('total process time', self.tpt, 'tps sum', np.sum(np.array(self.tpt)))
+      #print('psnrs', psnrs)
+
+    self.exit_threads()
+
+    return [self.postp_image(s) for s in styled_images]
 
