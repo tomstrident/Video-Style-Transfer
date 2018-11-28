@@ -1,6 +1,6 @@
 # Video-Style-Transfer
 
-Source files of my bachelor thesis [Video Style Transfer using Inpainting Methods and Image Pyramid Integration](https://drive.google.com/file/d/1n_rAxm3CAjw1Tq_HxoyV4ghFLUJI2eCJ/view?usp=sharing).
+Source files of my bachelor thesis [Video Style Transfer using Inpainting Methods and Image Pyramid Integration](https://drive.google.com/file/d/1QQagN_zXJtM9H5nvw-QPY6X8YsyLDJQJ/view?usp=sharing).
 
 A demo file `video_style_transfer_demo.py` is provided.
 
